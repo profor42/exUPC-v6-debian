@@ -305,10 +305,6 @@ table inet filter {
         iifname "enp2s0" tcp dport { 22, 53 } ct state new accept
         iifname "enp2s0" udp dport { 53, 67, 547 } ct state new accept
 
-        # DMZ – DNS, DHCP, DHCPv6
-        iifname "enp3s0" tcp dport 53 ct state new accept
-        iifname "enp3s0" udp dport { 53, 67, 547 } ct state new accept
-
         reject with icmpx type admin-prohibited
     }
 
@@ -322,15 +318,6 @@ table inet filter {
 
         # LAN ven
         iifname "enp2s0" oifname "enp1s0" ct state new accept
-
-        # DMZ ven
-        iifname "enp3s0" oifname "enp1s0" ct state new accept
-
-        # LAN do DMZ
-        iifname "enp2s0" oifname "enp3s0" ct state new accept
-
-        # DMZ do LAN - jen pro jistotu 
-        iifname "enp3s0" oifname "enp2s0" drop
 
         reject with icmpx type admin-prohibited
     }
@@ -358,13 +345,10 @@ named.conf.options
 options {
         directory "/var/cache/bind";
         dnssec-validation auto;
-#        listen-on-v6 { fd00:cafe:0:1::1; fd00:cafe:0:2::1; };
         listen-on-v6 { fd00:cafe:0:1::1; };
         listen-on { 127.0.0.1; 10.0.0.127; };
         version "not currently available";
         recursion yes;
-#        allow-recursion { 127.0.0.1; 10.0.0.0/24; 10.0.1.0/24; fd00:cafe:0:1::/64; fd00:cafe:0:2::/64; };
-#        allow-query { 127.0.0.1; 10.0.0.0/24; 10.0.1.0/24; fd00:cafe:0:1::/64; fd00:cafe:0:2::/64; };
         allow-recursion { 127.0.0.1; 10.0.0.0/24; fd00:cafe:0:1::/64; };
         allow-query { 127.0.0.1; 10.0.0.0/24; fd00:cafe:0:1::/64; };
         allow-transfer { none; }; 
