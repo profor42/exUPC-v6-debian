@@ -1,0 +1,383 @@
+Zajisteni konfigurace IPv6 doma s exUPC (Vodafone)
+
+------------------------------------------------------
+-- Prerekvizity:
+CPE od Vodafone nastaveno do rezimu bridge
+Router: APU2 a Debian 13 ve funkci routeru, DHCP serveru a DNS serveru
+
+SW:
+- update 
+apt update && apt dist-upgrade -y
+
+- instalace nftables:
+apt install nftables
+
+- odinstalace starych baliku nebo baliku, ktere jiz nebudou potreba:
+apt purge dhcpcd
+apt purge iptables netfilter-persistent iptables-persistent
+apt purge isc-dhcp-client
+apt purge ifupdown dhcpcd-base wpasupplicant
+
+- instalace dalsiho sw:
+apt install kea-dhcp4-server kea-dhcp6-server radvd
+apt install systemd-networkd
+apt install networkd-dispatcher
+------------------------------------------------------
+-- Konfigurace site - systemd-networkd:
+# Zakladni sitova konfigurace
+# (Vodafone prideluje IPv6 prefix pres DHCPv6-PD)
+# Debian ma spoustu DHCP klientu, ale zda se, ze s networkd byly nejmensi problemy.
+# networkd zastava nasledujici role:
+# DHCPv4 klient, DHCPv6 klient, DHCPv6-PD klient, SLAAC klient, DHCPv4 server, RA advertiser a IPAM.
+# IPAM je role, kdy spravuje prefixy prijate pred PD a distribuuje je na dalsi ifaces.
+# ULA adresy jsou pro statickou konfiguraci DNS serveru bezici na routeru.
+
+Vytvorit tri soubory v adresari:
+/etc/systemd/network
+
+1) Soubor:
+10-wan.network
+
+[Match]
+Name=enp1s0
+
+[Network]
+DHCP=yes
+IPv6AcceptRA=yes
+IPv6SendRA=no
+DHCPv6PrefixDelegation=yes
+
+[DHCPv4]
+RouteMetric=100
+UseDNS=no
+
+[DHCPv6]
+PrefixDelegationHint=::/56
+UseDNS=no
+
+[IPv6AcceptRA]
+DHCPv6Client=always
+UseDNS=no
+
+2) Soubor:
+20-lan.network
+
+[Match]
+Name=enp2s0
+
+[Network]
+Address=10.0.0.127/24
+Address=fd00:cafe:0:1::1/64
+IPv6AcceptRA=no
+DHCP=no
+IPv6SendRA=yes
+DHCPv6PrefixDelegation=yes
+
+[DHCPv6PrefixDelegation]
+SubnetId=0
+Announce=yes
+------------------------------------------------------
+-- Konfigurace parametru kernelu:
+# Povoleni forwardingu
+
+Vytvorit soubor:
+99-forwarding.conf
+v adresari:
+/etc/sysctl.d/
+
+s obsahem:
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+------------------------------------------------------
+-- Konfigurace radvd sluzby:
+# Sluzba pro Router Advertisement pro lokalni ifaces (LAN, DMZ)
+# Klienti, co umi DHCPv6, jej pouziji, zbytek dostane adresu via SLAAC
+
+Vytvorit (nebo nahradit) soubor v adresari:
+/etc/
+s nazvem:
+radvd.conf
+
+s obsahem:
+interface enp2s0 {
+    AdvSendAdvert on;
+    AdvManagedFlag on;       # M-flag: klienti mohou pouzit DHCPv6 pro adresu
+    AdvOtherConfigFlag on;   # O-flag: klienti si vezmou DNS/NTP přes DHCPv6
+
+    MinRtrAdvInterval 10;
+    MaxRtrAdvInterval 30;
+
+    RDNSS fd00:cafe:0:1::1 {    # Pro propagaci DNS servery via SLAAC
+        AdvRDNSSLifetime 600;
+    };
+
+    prefix ::/64 {
+        AdvOnLink on;
+        AdvAutonomous on;    # take povoleni SLAAC 
+        AdvRouterAddr on;
+        Base6Interface enp2s0;   # prefix vezme z adresy nastavene dhcp
+    };
+};
+------------------------------------------------------
+-- Konfigurace sluzby kea:
+# DHCPv4 a DHCPv6 server (pro LAN a DMZ)
+# Mohl by zastavat systemd-networkd, ale u nekterych klientu by to podle dostupneho infa mohlo delat problemy.
+# Pozn.: kea-dhcp6.conf je pouze placeholder pro LAN - realna konfigurace je generovana dynamicky.
+# Dynamnicke generovani se dele pomoci networkd-dispatcher podle aktualne prideleneho prefixu.
+
+Vytvorit nebo nahradit v adresari:
+/etc/kea/
+
+1) Soubor:
+kea-dhcp4.conf
+
+{
+  "Dhcp4": {
+    "interfaces-config": {
+      "interfaces": ["enp2s0"]
+    },
+    "lease-database": {
+      "type": "memfile",
+      "persist": true,
+      "name": "/var/lib/kea/kea-leases4.csv"
+    },
+    "valid-lifetime": 86400,
+    "option-data": [
+      {
+        "name": "domain-name-servers",
+        "data": "10.0.0.127"
+      }
+    ],
+    "subnet4": [
+      {
+        "id": 1,
+        "subnet": "10.0.0.0/24",
+        "interface": "enp2s0",
+        "pools": [{ "pool": "10.0.0.10 - 10.0.0.126" }],
+        "option-data": [
+          { "name": "routers", "data": "10.0.0.127" }
+        ],
+        "reservations": [
+          {
+            "hw-address": "aa:bb:cc:dd:ee:01",
+            "ip-address": "10.0.0.10",
+            "hostname": "server-lan-1"
+          }
+        ]
+      },
+    ]
+  }
+}
+
+2) Soubor:
+kea-dhcp6.conf
+
+{
+  "Dhcp6": {
+    "interfaces-config": {
+      "interfaces": ["enp2s0"]
+    },
+    "lease-database": {
+      "type": "memfile",
+      "persist": true,
+      "name": "/var/lib/kea/kea-leases6.csv"
+    },
+    "valid-lifetime": 86400,
+    "preferred-lifetime": 43200,
+    "option-data": [
+      {
+        "name": "dns-servers",
+        "data": "fd00:cafe:0:1::1"
+      }
+    ],
+    "subnet6": [
+      {
+        "id": 1,
+        "subnet": "2a02:8308:122:d500::/64",
+        "interface": "enp2s0",
+        "pools": [{ "pool": "2a02:8308:122:d500::10 - 2a02:8308:122:d500::fe" }],
+        "reservations": []
+      }
+    ]
+  }
+}
+
+Upravit unity pro kea-dhcp4-server a kea-dhcp6-server:
+- pro oba prikazy:
+systemctl edit kea-dhcp4-server
+systemctl edit kea-dhcp6-server
+upravit unitu nasledovne:
+
+[Unit]
+After=network.target
+
+[Service]
+Restart=on-failure
+RestartSec=5
+------------------------------------------------------
+-- Konfigurace networkd-dispatcher:
+# Scripty, ktere reaguji na zmenu sitove adresare a konfiguruje kea.
+
+Vytvorit nebo nahradit v adresari:
+/etc/networkd-dispatcher/routable.d/
+
+Soubor:
+50-kea-dhcp6
+
+#!/bin/bash
+
+[ "$IFACE" = "enp2s0" ] || exit 0
+
+ADDR=$(ip -6 addr show enp2s0 scope global dynamic | awk '/inet6/{print $2}' | head -1)
+[ -z "$ADDR" ] && exit 0
+
+# Extrakce /64
+PREFIX=$(echo "$ADDR" | cut -d/ -f1 | awk -F: '{print $1":"$2":"$3":"$4}')
+SUBNET="${PREFIX}::/64"
+POOL_START="${PREFIX}::10"
+POOL_END="${PREFIX}::fe"
+GW="fd00:cafe:0:1::1"
+
+cat > /etc/kea/kea-dhcp6.conf << KEAEOF
+{
+  "Dhcp6": {
+    "interfaces-config": {
+      "interfaces": ["enp2s0"]
+    },
+    "lease-database": {
+      "type": "memfile",
+      "persist": true,
+      "name": "/var/lib/kea/kea-leases6.csv"
+    },
+    "valid-lifetime": 86400,
+    "preferred-lifetime": 43200,
+    "option-data": [
+      {
+        "name": "dns-servers",
+        "data": "${GW}"
+      }
+    ],
+    "subnet6": [
+      {
+        "id": 1,
+        "subnet": "${SUBNET}",
+        "interface": "enp2s0",
+        "pools": [{ "pool": "${POOL_START} - ${POOL_END}" }],
+        "reservations": []
+      }
+    ]
+  }
+}
+KEAEOF
+
+systemctl reload-or-restart kea-dhcp6-server
+------------------------------------------------------
+-- Konfigurace firewallu:
+# Staticka konfigurace nftables.
+
+V adresari:
+/etc/
+vytvorit nebo nahradit soubor:
+nftables.conf
+
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        ct state related,established accept
+        ct state invalid drop
+
+        iifname "lo" accept
+
+        # ICMP
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+
+        # DHCPv6 klient na WAN
+        iifname "enp1s0" ip6 saddr fe80::/10 udp dport 546 accept
+
+        # LAN – SSH, DNS, DHCP, DHCPv6
+        iifname "enp2s0" tcp dport { 22, 53 } ct state new accept
+        iifname "enp2s0" udp dport { 53, 67, 547 } ct state new accept
+
+        # DMZ – DNS, DHCP, DHCPv6
+        iifname "enp3s0" tcp dport 53 ct state new accept
+        iifname "enp3s0" udp dport { 53, 67, 547 } ct state new accept
+
+        reject with icmpx type admin-prohibited
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+
+        ct state related,established accept
+        ct state invalid drop
+
+        ip6 nexthdr icmpv6 accept
+
+        # LAN ven
+        iifname "enp2s0" oifname "enp1s0" ct state new accept
+
+        # DMZ ven
+        iifname "enp3s0" oifname "enp1s0" ct state new accept
+
+        # LAN do DMZ
+        iifname "enp2s0" oifname "enp3s0" ct state new accept
+
+        # DMZ do LAN - jen pro jistotu 
+        iifname "enp3s0" oifname "enp2s0" drop
+
+        reject with icmpx type admin-prohibited
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+
+table ip nat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "enp1s0" masquerade
+    }
+}
+------------------------------------------------------
+-- Konfigurace named
+# Zajisteni, ze bude fungovat pouze jako validujici rekurzor pro LAN a DMZ
+
+V adresari:
+/etc/bind/
+upravit soubor:
+named.conf.options
+
+options {
+        directory "/var/cache/bind";
+        dnssec-validation auto;
+#        listen-on-v6 { fd00:cafe:0:1::1; fd00:cafe:0:2::1; };
+        listen-on-v6 { fd00:cafe:0:1::1; };
+        listen-on { 127.0.0.1; 10.0.0.127; };
+        version "not currently available";
+        recursion yes;
+#        allow-recursion { 127.0.0.1; 10.0.0.0/24; 10.0.1.0/24; fd00:cafe:0:1::/64; fd00:cafe:0:2::/64; };
+#        allow-query { 127.0.0.1; 10.0.0.0/24; 10.0.1.0/24; fd00:cafe:0:1::/64; fd00:cafe:0:2::/64; };
+        allow-recursion { 127.0.0.1; 10.0.0.0/24; fd00:cafe:0:1::/64; };
+        allow-query { 127.0.0.1; 10.0.0.0/24; fd00:cafe:0:1::/64; };
+        allow-transfer { none; }; 
+#       querylog yes;
+};
+
+V adresari:
+/etc/default
+v souboru:
+named
+
+zkontrolovat, ze v OPTIONS neni -4
+------------------------------------------------------
+-- Poznamka pro klienty:
+# Minimalne na Fedore ma Firefox preferovano IPv4. Opravi se v about:config volbou:
+# network.dns.preferIPv6=true 
